@@ -1,5 +1,4 @@
 
-import os
 import json
 import streamlit as st
 import fitz
@@ -12,12 +11,20 @@ st.set_page_config(
 )
 
 st.title("🎓 المدرس الشخصي الذكي")
-st.write("ارفع درسك، احصل على ملخص، واختبر معلوماتك بالذكاء الاصطناعي.")
-
-api_key = st.text_input(
-    "أدخل مفتاح Gemini API",
-    type="password"
+st.write(
+    "ارفع درسك، احصل على ملخص، "
+    "واختبر معلوماتك بالذكاء الاصطناعي."
 )
+
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+    client = genai.Client(api_key=api_key)
+except Exception:
+    st.error(
+        "لم يتم إعداد مفتاح Gemini بشكل صحيح. "
+        "يرجى مراجعة إعدادات التطبيق."
+    )
+    st.stop()
 
 uploaded_file = st.file_uploader(
     "اختر ملف الدرس بصيغة PDF",
@@ -25,13 +32,7 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file and st.button("📚 تحليل الدرس"):
-    if not api_key:
-        st.error("أدخل مفتاح Gemini API أولًا.")
-        st.stop()
-
     try:
-        client = genai.Client(api_key=api_key)
-
         with st.spinner("جارٍ استخراج النص من الملف..."):
             document = fitz.open(
                 stream=uploaded_file.getvalue(),
@@ -43,13 +44,14 @@ if uploaded_file and st.button("📚 تحليل الدرس"):
 
         if len(lesson_text.strip()) < 100:
             st.warning(
-                "يبدو أن الملف ممسوح ضوئيًا. "
-                "هذه النسخة تحتاج إلى إضافة OCR لقراءته."
+                "لم نستطع استخراج نص كافٍ. "
+                "قد يكون الملف ممسوحًا ضوئيًا؛ "
+                "سنضيف دعم OCR لاحقًا."
             )
             st.stop()
 
         with st.spinner("جارٍ تلخيص الدرس..."):
-            summary_response = client.models.generate_content(
+            response = client.models.generate_content(
                 model="gemini-3.5-flash-lite",
                 contents=(
                     "لخّص الدرس التالي باللغة العربية، "
@@ -57,96 +59,111 @@ if uploaded_file and st.button("📚 تحليل الدرس"):
                     + lesson_text[:18000]
                 )
             )
-            summary = summary_response.text
+
+        summary = response.text
+        if not summary:
+            st.error("لم يُرجع النموذج ملخصًا. حاول مرة أخرى.")
+            st.stop()
 
         st.session_state["summary"] = summary
-        st.session_state["lesson_text"] = lesson_text
+        st.session_state["quiz"] = None
 
         st.success("تم تحليل الدرس بنجاح!")
 
     except Exception as e:
-        st.error(f"حدث خطأ: {e}")
+        st.error(f"حدث خطأ أثناء تحليل الدرس: {e}")
 
-if "summary" in st.session_state:
+if st.session_state.get("summary"):
     st.subheader("📝 ملخص الدرس")
     st.markdown(st.session_state["summary"])
 
     if st.button("🧠 إنشاء اختبار من 10 أسئلة"):
-        try:
-            client = genai.Client(api_key=api_key)
-
-            prompt = f"""
-أنشئ 10 أسئلة اختيار من متعدد باللغة العربية
-اعتمادًا على الدرس التالي.
-
-أعد JSON صالحًا فقط بهذا الشكل:
+        prompt = f"""
+أنشئ 10 أسئلة اختيار من متعدد باللغة العربية اعتمادًا
+على الدرس التالي. أعد JSON صالحًا فقط بهذا الشكل:
 {{
   "questions": [
     {{
       "question": "نص السؤال",
-      "options": ["أ", "ب", "ج", "د"],
+      "options": ["الخيار الأول", "الخيار الثاني", "الخيار الثالث", "الخيار الرابع"],
       "correct_answer": 0,
       "explanation": "شرح الإجابة"
     }}
   ]
 }}
-
-correct_answer هو رقم الإجابة الصحيحة بدءًا من الصفر.
-كل سؤال له أربعة خيارات وإجابة صحيحة واحدة.
+يجب أن يحتوي كل سؤال على أربعة خيارات.
+correct_answer هو فهرس الإجابة الصحيحة بدءًا من الصفر.
 
 الدرس:
 {st.session_state["summary"][:9000]}
 """
+        try:
             with st.spinner("جارٍ إنشاء الأسئلة..."):
                 response = client.models.generate_content(
                     model="gemini-3.5-flash-lite",
                     contents=prompt
                 )
 
-            raw = response.text.strip()
+            raw = (response.text or "").strip()
             raw = raw.replace("```json", "").replace("```", "").strip()
-            quiz = json.loads(raw)
+            quiz_data = json.loads(raw)
+            questions = quiz_data["questions"]
 
-            st.session_state["quiz"] = quiz["questions"]
-            st.session_state["answers"] = {}
+            if len(questions) != 10:
+                raise ValueError("لم يُنشأ العدد المطلوب من الأسئلة.")
+
+            for q in questions:
+                if (
+                    len(q["options"]) != 4
+                    or q["correct_answer"] not in range(4)
+                ):
+                    raise ValueError("تنسيق أحد الأسئلة غير صحيح.")
+
+            st.session_state["quiz"] = questions
+            st.session_state["quiz_submitted"] = False
 
         except Exception as e:
             st.error(f"تعذر إنشاء الاختبار: {e}")
 
-if "quiz" in st.session_state:
+if st.session_state.get("quiz"):
+    questions = st.session_state["quiz"]
     st.subheader("🧠 اختبر معلوماتك")
 
     with st.form("quiz_form"):
-        for i, q in enumerate(st.session_state["quiz"]):
+        answers = {}
+
+        for i, q in enumerate(questions):
             st.markdown(f"**السؤال {i + 1}: {q['question']}**")
-            answer = st.radio(
+            answers[i] = st.radio(
                 "اختر إجابتك:",
-                options=range(len(q["options"])),
+                options=range(4),
                 format_func=lambda x, opts=q["options"]: opts[x],
-                key=f"answer_{i}"
+                key=f"answer_{i}",
+                index=None
             )
-            st.session_state["answers"][i] = answer
 
         submitted = st.form_submit_button("✅ تصحيح الاختبار")
 
     if submitted:
-        score = 0
+        if any(a is None for a in answers.values()):
+            st.warning("أجب عن جميع الأسئلة أولًا.")
+        else:
+            score = 0
 
-        for i, q in enumerate(st.session_state["quiz"]):
-            selected = st.session_state["answers"][i]
-            correct = q["correct_answer"]
+            for i, q in enumerate(questions):
+                selected = answers[i]
+                correct = q["correct_answer"]
 
-            if selected == correct:
-                score += 1
-                st.success(f"السؤال {i + 1}: إجابة صحيحة!")
-            else:
-                st.error(
-                    f"السؤال {i + 1}: الإجابة الصحيحة هي "
-                    f"{q['options'][correct]}"
-                )
+                if selected == correct:
+                    score += 1
+                    st.success(f"السؤال {i + 1}: إجابة صحيحة!")
+                else:
+                    st.error(
+                        f"السؤال {i + 1}: الإجابة الصحيحة هي "
+                        f"{q['options'][correct]}"
+                    )
 
-            st.write(q["explanation"])
+                st.write(q["explanation"])
 
-        st.subheader(
-            f"🎯 نتيجتك: {score} / {len(st.session_state['quiz'])}"
-        )
+            st.subheader(f"🎯 نتيجتك: {score} / {len(questions)}")
+            st.progress(score / len(questions))
